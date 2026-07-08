@@ -6,9 +6,11 @@
 事前に `notebooklm login` で認証しておくこと(README参照)
 """
 
+import asyncio
 import datetime
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 import httpx
@@ -51,8 +53,55 @@ def convert_to_m4a(src: pathlib.Path) -> pathlib.Path:
 def auth_error(e: Exception) -> HTTPException:
     return HTTPException(
         status_code=401,
-        detail=f"NotebookLM認証エラー: {e} — ターミナルで `notebooklm login` を実行して再認証してください。",
+        detail=f"NotebookLM認証エラー: {e} — 画面の「再認証」ボタンから再ログインしてください。",
     )
+
+
+# ---- 認証(Web画面から完結できるようにする) ----
+
+NOTEBOOKLM_CLI = str(pathlib.Path(sys.executable).parent / "notebooklm")
+_login_proc: "asyncio.subprocess.Process | None" = None
+
+
+async def _run_cli(*args: str, timeout: float = 90.0) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        NOTEBOOKLM_CLI, *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 1, "timeout"
+    return proc.returncode or 0, out.decode(errors="replace")
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    """保存済み認証の有無をチェック。ログイン進行中かどうかも返す。"""
+    code, _ = await _run_cli("auth", "check", timeout=30.0)
+    logging_in = _login_proc is not None and _login_proc.returncode is None
+    return {"ok": code == 0, "logging_in": logging_in}
+
+
+@app.post("/api/auth/refresh")
+async def auth_refresh():
+    """保存済みブラウザプロファイルでCookieを裏で更新(画面には何も出ない)。"""
+    code, out = await _run_cli("auth", "refresh", timeout=120.0)
+    return {"ok": code == 0, "detail": out[-500:]}
+
+
+@app.post("/api/auth/login")
+async def auth_login():
+    """このMac上にログイン用ブラウザを開く。完了は /api/auth/status のポーリングで検知。"""
+    global _login_proc
+    if _login_proc is not None and _login_proc.returncode is None:
+        return {"started": True, "already_running": True}
+    _login_proc = await asyncio.create_subprocess_exec(
+        NOTEBOOKLM_CLI, "login",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    return {"started": True, "already_running": False}
 
 
 @app.get("/")

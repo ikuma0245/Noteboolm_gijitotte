@@ -97,6 +97,13 @@
     </details>
   </div>
 
+  <div class="card" id="authCard" style="display:none">
+    <div class="rec-row">
+      <div class="status error" id="authMsg">NotebookLMの認証が切れています</div>
+      <button class="btn primary" id="authBtn">🔑 再認証</button>
+    </div>
+  </div>
+
   <div class="card">
     <div class="rec-row">
       <button class="rec-btn" id="recBtn">
@@ -148,14 +155,16 @@
     $('meetingTitle').value = localStorage.getItem('gijiroku_title') || '';
   } catch (e) { $('promptInput').value = DEFAULT_PROMPT; }
 
-  // ノートブック一覧を取得
-  (async () => {
+  // ノートブック一覧を取得(401なら再認証カードを表示)
+  async function loadNotebooks() {
     try {
       const res = await fetch('/api/notebooks');
+      if (res.status === 401) { showAuthCard('NotebookLMの認証が切れています'); return; }
       if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
       const nbs = await res.json();
       const sel = $('notebookSelect');
       const saved = (() => { try { return localStorage.getItem('gijiroku_nb') || ''; } catch(e) { return ''; } })();
+      sel.length = 1; // 先頭の「新規作成」以外をクリアして再構築
       for (const nb of nbs) {
         const opt = document.createElement('option');
         opt.value = nb.id;
@@ -163,10 +172,52 @@
         sel.appendChild(opt);
       }
       if (saved && [...sel.options].some(o => o.value === saved)) sel.value = saved;
+      $('authCard').style.display = 'none';
+      setStatus('待機中');
     } catch (e) {
       setStatus('ノートブック一覧の取得に失敗: ' + e.message, true);
     }
-  })();
+  }
+  loadNotebooks();
+
+  // ---- 再認証(Web完結): まず裏でCookie更新 → ダメならログイン用ブラウザを開く ----
+  function showAuthCard(msg) {
+    $('authMsg').textContent = msg;
+    $('authCard').style.display = 'block';
+  }
+
+  $('authBtn').addEventListener('click', async () => {
+    const btn = $('authBtn');
+    btn.disabled = true;
+    try {
+      $('authMsg').textContent = 'Cookieを更新しています…';
+      let res = await fetch('/api/auth/refresh', { method: 'POST' });
+      let data = await res.json();
+      if (data.ok) {
+        $('authMsg').textContent = '✓ 認証を更新しました';
+        await loadNotebooks();
+        return;
+      }
+      // refreshで直らない → ログイン用ブラウザを開く
+      await fetch('/api/auth/login', { method: 'POST' });
+      $('authMsg').textContent = 'このMacに開いたブラウザでGoogleログインしてください(完了すると自動で反映されます)…';
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 3000));
+        const s = await (await fetch('/api/auth/status')).json();
+        if (!s.logging_in) {
+          if (s.ok) { $('authMsg').textContent = '✓ ログインしました'; await loadNotebooks(); }
+          else showAuthCard('ログインが完了しませんでした。もう一度お試しください');
+          return;
+        }
+      }
+      showAuthCard('ログインがタイムアウトしました(5分)。もう一度お試しください');
+    } catch (e) {
+      showAuthCard('再認証に失敗: ' + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   const fmt = s => String(Math.floor(s/60)).padStart(2,'0') + ':' + String(Math.floor(s%60)).padStart(2,'0');
   function setStatus(text, isError) {
@@ -240,6 +291,7 @@
     try {
       const res = await fetch('/api/upload', { method: 'POST', body: form });
       const data = await res.json();
+      if (res.status === 401) showAuthCard('NotebookLMの認証が切れています(録音はローカルに保存済み。再認証後にやり直せます)');
       if (!res.ok) throw new Error(data.detail || res.statusText);
       showResult(data);
       setStatus('完了!');
