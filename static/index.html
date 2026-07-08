@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>議事録レコーダー — NotebookLM 全自動</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎙️</text></svg>">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1a1d21; --sub: #6b7280;
+    --accent: #2563eb; --accent-hover: #1d4ed8; --rec: #dc2626;
+    --border: #e5e7eb; --success: #059669; --error: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh; padding: 24px 16px;
+  }
+  .container { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 20px; font-weight: 700; }
+  h1 span { color: var(--sub); font-weight: 400; font-size: 14px; margin-left: 8px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  label { font-size: 13px; font-weight: 600; color: var(--sub); display: block; margin-bottom: 6px; }
+  .field { margin-bottom: 14px; }
+  input[type=text], select, textarea {
+    width: 100%; font-size: 15px; padding: 10px 12px;
+    border: 1px solid var(--border); border-radius: 8px; font-family: inherit;
+    background: var(--card); color: var(--text);
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  textarea { resize: vertical; min-height: 90px; font-size: 13px; line-height: 1.7; }
+
+  .rec-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .rec-btn {
+    display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 600;
+    color: #fff; background: var(--rec); border: none; border-radius: 999px;
+    padding: 14px 28px; cursor: pointer;
+  }
+  .rec-btn:hover { opacity: .9; }
+  .rec-btn.recording { background: #374151; }
+  .rec-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .rec-dot { width: 12px; height: 12px; border-radius: 50%; background: #fff; }
+  .recording .rec-dot { animation: blink 1s infinite; background: #f87171; }
+  @keyframes blink { 50% { opacity: .3; } }
+  .timer { font-variant-numeric: tabular-nums; font-size: 22px; font-weight: 600; }
+  .status { font-size: 13px; color: var(--sub); flex: 1; min-width: 200px; }
+  .status.error { color: var(--error); font-weight: 600; }
+
+  .progress { display: none; align-items: center; gap: 12px; padding: 14px 0 4px; }
+  .spinner {
+    width: 20px; height: 20px; border: 3px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .progress-text { font-size: 14px; color: var(--sub); }
+
+  #resultCard { display: none; }
+  .result-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .result-head h2 { font-size: 16px; }
+  .minutes { font-size: 14.5px; line-height: 1.9; }
+  .minutes h1, .minutes h2, .minutes h3 { margin: 14px 0 6px; font-size: 16px; }
+  .minutes h1 { font-size: 18px; }
+  .minutes ul, .minutes ol { padding-left: 22px; margin: 4px 0; }
+  .minutes p { margin: 6px 0; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btn {
+    font-size: 14px; font-weight: 600; padding: 10px 16px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card); color: var(--text);
+    cursor: pointer; text-decoration: none; display: inline-block;
+  }
+  .btn:hover { background: var(--bg); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: var(--accent-hover); }
+  details summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--sub); }
+  details[open] summary { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎙️ 議事録レコーダー<span>録音 → NotebookLM → 議事録 全自動</span></h1>
+
+  <div class="card">
+    <div class="field">
+      <label for="meetingTitle">会議名</label>
+      <input type="text" id="meetingTitle" placeholder="例: 定例ミーティング">
+    </div>
+    <div class="field">
+      <label for="notebookSelect">アップロード先ノートブック</label>
+      <select id="notebookSelect">
+        <option value="">➕ 新規ノートブックを作成(会議名で)</option>
+      </select>
+    </div>
+    <details>
+      <summary>議事録プロンプトをカスタマイズ</summary>
+      <textarea id="promptInput"></textarea>
+    </details>
+  </div>
+
+  <div class="card">
+    <div class="rec-row">
+      <button class="rec-btn" id="recBtn">
+        <span class="rec-dot"></span><span id="recLabel">録音開始</span>
+      </button>
+      <div class="timer" id="timer">00:00</div>
+      <div class="status" id="status">待機中</div>
+    </div>
+    <div class="progress" id="progress">
+      <div class="spinner"></div>
+      <div class="progress-text" id="progressText"></div>
+    </div>
+  </div>
+
+  <div class="card" id="resultCard">
+    <div class="result-head">
+      <h2>📝 議事録</h2>
+      <div class="actions">
+        <button class="btn" id="copyBtn">📋 コピー</button>
+        <button class="btn" id="dlBtn">⬇️ 保存 (.md)</button>
+        <a class="btn primary" id="nbLink" href="#" target="_blank">🔗 NotebookLMで開く</a>
+      </div>
+    </div>
+    <div class="minutes" id="minutes"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const DEFAULT_PROMPT = `このソースの音声内容をもとに、以下の形式で議事録を作成してください。
+
+# 議事録
+## 会議概要
+## 議題と議論の要点
+## 決定事項
+## TODO・アクションアイテム (担当者・期限が分かれば明記)
+## 次回への持ち越し事項
+
+聞き取りにくい箇所は文脈から自然に補ってください。`;
+
+  let mediaRecorder = null, stream = null, chunks = [];
+  let isRecording = false, startTime = 0, timerInterval = null;
+  let rawMinutes = '';
+
+  // 前回値の復元
+  try {
+    $('promptInput').value = localStorage.getItem('gijiroku_prompt') || DEFAULT_PROMPT;
+    $('meetingTitle').value = localStorage.getItem('gijiroku_title') || '';
+  } catch (e) { $('promptInput').value = DEFAULT_PROMPT; }
+
+  // ノートブック一覧を取得
+  (async () => {
+    try {
+      const res = await fetch('/api/notebooks');
+      if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+      const nbs = await res.json();
+      const sel = $('notebookSelect');
+      const saved = (() => { try { return localStorage.getItem('gijiroku_nb') || ''; } catch(e) { return ''; } })();
+      for (const nb of nbs) {
+        const opt = document.createElement('option');
+        opt.value = nb.id;
+        opt.textContent = '📓 ' + nb.title;
+        sel.appendChild(opt);
+      }
+      if (saved && [...sel.options].some(o => o.value === saved)) sel.value = saved;
+    } catch (e) {
+      setStatus('ノートブック一覧の取得に失敗: ' + e.message, true);
+    }
+  })();
+
+  const fmt = s => String(Math.floor(s/60)).padStart(2,'0') + ':' + String(Math.floor(s%60)).padStart(2,'0');
+  function setStatus(text, isError) {
+    $('status').textContent = text;
+    $('status').className = 'status' + (isError ? ' error' : '');
+  }
+  function setProgress(text) {
+    $('progress').style.display = text ? 'flex' : 'none';
+    $('progressText').textContent = text || '';
+  }
+
+  async function startRecording() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      setStatus('マイクにアクセスできません: ' + e.message, true);
+      return;
+    }
+    chunks = [];
+    const mime = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4'
+               : MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
+    mediaRecorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = onStopped;
+    mediaRecorder.start(1000);
+
+    isRecording = true;
+    startTime = Date.now();
+    $('recBtn').classList.add('recording');
+    $('recLabel').textContent = '録音停止 & 送信';
+    setStatus('録音中…');
+    $('resultCard').style.display = 'none';
+    timerInterval = setInterval(() => { $('timer').textContent = fmt((Date.now()-startTime)/1000); }, 500);
+  }
+
+  function stopRecording() {
+    isRecording = false;
+    clearInterval(timerInterval);
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    $('recBtn').classList.remove('recording');
+    $('recLabel').textContent = '録音開始';
+  }
+
+  async function onStopped() {
+    const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+    const ext = blob.type.includes('mp4') ? 'm4a' : 'webm';
+    const title = $('meetingTitle').value.trim() || '会議';
+    const prompt = $('promptInput').value.trim();
+    const nbId = $('notebookSelect').value;
+
+    try {
+      localStorage.setItem('gijiroku_prompt', prompt);
+      localStorage.setItem('gijiroku_title', title);
+      localStorage.setItem('gijiroku_nb', nbId);
+    } catch (e) {}
+
+    // 万一に備えローカルにも自動保存
+    autoDownload(blob, ext, title);
+
+    $('recBtn').disabled = true;
+    setStatus('NotebookLMへ送信中');
+    setProgress('音声をアップロードして議事録を生成しています…(会議の長さにより数分かかります)');
+
+    const form = new FormData();
+    form.append('file', blob, `recording.${ext}`);
+    form.append('title', title);
+    form.append('notebook_id', nbId);
+    form.append('prompt', prompt);
+
+    try {
+      const res = await fetch('/api/upload', { method: 'POST', body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      showResult(data);
+      setStatus('完了!');
+    } catch (e) {
+      setStatus('失敗: ' + e.message, true);
+    } finally {
+      setProgress('');
+      $('recBtn').disabled = false;
+    }
+  }
+
+  function autoDownload(blob, ext, title) {
+    const d = new Date();
+    const name = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}_${title.replace(/[\\/:*?"<>|]/g,'_')}.${ext}`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  function showResult(data) {
+    rawMinutes = data.minutes || '';
+    $('minutes').innerHTML = (window.marked && marked.parse) ? marked.parse(rawMinutes) : '<pre>' + rawMinutes + '</pre>';
+    $('nbLink').href = data.notebook_url;
+    $('resultCard').style.display = 'block';
+    $('resultCard').scrollIntoView({ behavior: 'smooth' });
+  }
+
+  $('recBtn').addEventListener('click', () => isRecording ? stopRecording() : startRecording());
+
+  $('copyBtn').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(rawMinutes);
+    $('copyBtn').textContent = '✓ コピーしました';
+    setTimeout(() => { $('copyBtn').textContent = '📋 コピー'; }, 1500);
+  });
+
+  $('dlBtn').addEventListener('click', () => {
+    const blob = new Blob([rawMinutes], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = ($('meetingTitle').value.trim() || '会議') + '_議事録.md';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  window.addEventListener('beforeunload', e => {
+    if (isRecording) { e.preventDefault(); e.returnValue = ''; }
+  });
+})();
+</script>
+</body>
+</html>
