@@ -78,12 +78,16 @@
 </head>
 <body>
 <div class="container">
-  <h1>🎙️ 議事録レコーダー<span>録音 → NotebookLM → 議事録 全自動</span></h1>
+  <h1>🎙️ 議事録レコーダー<span>録音 → NotebookLM → 議事録 全自動</span><span><a href="/admin" style="color:var(--accent);text-decoration:none">📚 会議一覧</a></span></h1>
 
   <div class="card">
     <div class="field">
       <label for="meetingTitle">会議名</label>
       <input type="text" id="meetingTitle" placeholder="例: 定例ミーティング">
+    </div>
+    <div class="field">
+      <label for="recorderName">記録者(あなたの名前)</label>
+      <input type="text" id="recorderName" placeholder="例: 三堀">
     </div>
     <div class="field">
       <label for="notebookSelect">アップロード先ノートブック</label>
@@ -147,12 +151,13 @@
 
   let mediaRecorder = null, stream = null, chunks = [];
   let isRecording = false, startTime = 0, timerInterval = null;
-  let rawMinutes = '';
+  let rawMinutes = '', recordedSec = 0;
 
   // 前回値の復元
   try {
     $('promptInput').value = localStorage.getItem('gijiroku_prompt') || DEFAULT_PROMPT;
     $('meetingTitle').value = localStorage.getItem('gijiroku_title') || '';
+    $('recorderName').value = localStorage.getItem('gijiroku_recorder') || '';
   } catch (e) { $('promptInput').value = DEFAULT_PROMPT; }
 
   // ノートブック一覧を取得(401なら再認証カードを表示)
@@ -255,6 +260,7 @@
 
   function stopRecording() {
     isRecording = false;
+    recordedSec = Math.round((Date.now() - startTime) / 1000);
     clearInterval(timerInterval);
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
     if (stream) stream.getTracks().forEach(t => t.stop());
@@ -268,11 +274,13 @@
     const title = $('meetingTitle').value.trim() || '会議';
     const prompt = $('promptInput').value.trim();
     const nbId = $('notebookSelect').value;
+    const recorder = $('recorderName').value.trim();
 
     try {
       localStorage.setItem('gijiroku_prompt', prompt);
       localStorage.setItem('gijiroku_title', title);
       localStorage.setItem('gijiroku_nb', nbId);
+      localStorage.setItem('gijiroku_recorder', recorder);
     } catch (e) {}
 
     // 万一に備えローカルにも自動保存
@@ -287,6 +295,8 @@
     form.append('title', title);
     form.append('notebook_id', nbId);
     form.append('prompt', prompt);
+    form.append('recorder', recorder);
+    form.append('duration_sec', recordedSec);
 
     try {
       const res = await fetch('/api/upload', { method: 'POST', body: form });
@@ -294,7 +304,9 @@
       if (res.status === 401) showAuthCard('NotebookLMの認証が切れています(録音はローカルに保存済み。再認証後にやり直せます)');
       if (!res.ok) throw new Error(data.detail || res.statusText);
       showResult(data);
-      setStatus('完了!');
+      if (data.firebase_saved) setStatus('完了! ☁️ 会議一覧にも保存しました');
+      else if (data.firebase_error) setStatus('完了(⚠️ 共有保存に失敗: ' + data.firebase_error + ')', true);
+      else setStatus('完了!');
     } catch (e) {
       setStatus('失敗: ' + e.message, true);
     } finally {

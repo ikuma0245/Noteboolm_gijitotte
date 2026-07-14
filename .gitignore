@@ -2,3 +2,6 @@
 __pycache__/
 .DS_Store
 *.pyc
+
+# Firebaseサービスアカウント鍵 — 絶対にコミットしない(寮生には別途手渡し)
+firebase-key.json

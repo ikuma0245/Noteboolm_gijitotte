@@ -8,6 +8,8 @@
 
 import asyncio
 import datetime
+import json
+import mimetypes
 import pathlib
 import subprocess
 import sys
@@ -16,7 +18,7 @@ import tempfile
 import httpx
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from notebooklm import NotebookLMClient
 
 BASE = pathlib.Path(__file__).parent
@@ -109,6 +111,176 @@ def index():
     return FileResponse(BASE / "static" / "index.html")
 
 
+# ---- Firebase(録音・議事録の共有保存 + 管理画面) ----
+# フォルダ直下に firebase-key.json(サービスアカウント鍵)を置くと有効になる。
+# 無ければこの機能は静かにオフになり、アプリ本体はこれまで通り動く。
+
+FIREBASE_KEY = BASE / "firebase-key.json"
+
+
+def fb_ready() -> bool:
+    try:
+        import firebase_admin
+        if firebase_admin._apps:
+            return True
+        if not FIREBASE_KEY.exists():
+            return False
+        from firebase_admin import credentials, storage
+
+        info = json.loads(FIREBASE_KEY.read_text())
+        cred = credentials.Certificate(str(FIREBASE_KEY))
+        pid = info["project_id"]
+        firebase_admin.initialize_app(cred, {"storageBucket": f"{pid}.firebasestorage.app"})
+        # 新形式バケットが無い古いプロジェクトは appspot.com に切り替え
+        try:
+            if not storage.bucket().exists():
+                firebase_admin.delete_app(firebase_admin.get_app())
+                firebase_admin.initialize_app(cred, {"storageBucket": f"{pid}.appspot.com"})
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _fb_save(audio_path: pathlib.Path, meta: dict) -> str:
+    """音声をStorageへ、議事録+メタ情報をFirestoreへ保存してドキュメントIDを返す。"""
+    from firebase_admin import firestore, storage
+
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_title = meta["source_title"].replace("/", "_")
+    blob_path = f"recordings/{safe_title}_{ts}{audio_path.suffix}"
+    blob = storage.bucket().blob(blob_path)
+    blob.upload_from_filename(
+        str(audio_path),
+        content_type=mimetypes.guess_type(audio_path.name)[0] or "audio/mp4",
+    )
+
+    db = firestore.client()
+    doc = db.collection("meetings").document()
+    doc.set({
+        "title": meta["title"],
+        "source_title": meta["source_title"],
+        "recorder": meta["recorder"],
+        "minutes": meta["minutes"],
+        "notebook_id": meta["notebook_id"],
+        "notebook_url": meta["notebook_url"],
+        "audio_path": blob_path,
+        "duration_sec": meta["duration_sec"],
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    return doc.id
+
+
+def _require_fb():
+    if not fb_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="Firebase未設定です。firebase-key.json をこのフォルダに置いてください(README参照)。",
+        )
+
+
+@app.get("/api/firebase/status")
+async def firebase_status():
+    return {"configured": fb_ready()}
+
+
+@app.get("/admin")
+def admin_page():
+    return FileResponse(BASE / "static" / "admin.html")
+
+
+@app.get("/api/meetings")
+async def meetings_list():
+    _require_fb()
+
+    def _list():
+        from firebase_admin import firestore
+        db = firestore.client()
+        docs = (
+            db.collection("meetings")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(300)
+            .stream()
+        )
+        out = []
+        for d in docs:
+            x = d.to_dict() or {}
+            created = x.get("created_at")
+            out.append({
+                "id": d.id,
+                "title": x.get("title", ""),
+                "recorder": x.get("recorder", ""),
+                "duration_sec": x.get("duration_sec", 0),
+                "created_at": created.isoformat() if created else None,
+                "notebook_url": x.get("notebook_url", ""),
+            })
+        return out
+
+    return await asyncio.to_thread(_list)
+
+
+@app.get("/api/meetings/{meeting_id}")
+async def meeting_detail(meeting_id: str):
+    _require_fb()
+
+    def _get():
+        from firebase_admin import firestore
+        d = firestore.client().collection("meetings").document(meeting_id).get()
+        if not d.exists:
+            raise HTTPException(status_code=404, detail="会議が見つかりません")
+        x = d.to_dict() or {}
+        created = x.get("created_at")
+        x["created_at"] = created.isoformat() if created else None
+        x["id"] = d.id
+        return x
+
+    return await asyncio.to_thread(_get)
+
+
+@app.get("/api/meetings/{meeting_id}/audio")
+async def meeting_audio(meeting_id: str):
+    _require_fb()
+
+    def _open():
+        from firebase_admin import firestore, storage
+        d = firestore.client().collection("meetings").document(meeting_id).get()
+        if not d.exists:
+            raise HTTPException(status_code=404, detail="会議が見つかりません")
+        path = (d.to_dict() or {}).get("audio_path")
+        if not path:
+            raise HTTPException(status_code=404, detail="音声がありません")
+        blob = storage.bucket().blob(path)
+        if not blob.exists():
+            raise HTTPException(status_code=404, detail="音声ファイルが見つかりません")
+        return blob.open("rb"), mimetypes.guess_type(path)[0] or "audio/mp4"
+
+    fh, media_type = await asyncio.to_thread(_open)
+    return StreamingResponse(fh, media_type=media_type)
+
+
+@app.delete("/api/meetings/{meeting_id}")
+async def meeting_delete(meeting_id: str):
+    _require_fb()
+
+    def _delete():
+        from firebase_admin import firestore, storage
+        ref = firestore.client().collection("meetings").document(meeting_id)
+        d = ref.get()
+        if not d.exists:
+            raise HTTPException(status_code=404, detail="会議が見つかりません")
+        path = (d.to_dict() or {}).get("audio_path")
+        if path:
+            try:
+                storage.bucket().blob(path).delete()
+            except Exception:
+                pass
+        ref.delete()
+
+    await asyncio.to_thread(_delete)
+    return {"deleted": True}
+
+
 @app.get("/api/notebooks")
 async def list_notebooks():
     try:
@@ -125,6 +297,8 @@ async def upload(
     title: str = Form("会議"),
     notebook_id: str = Form(""),
     prompt: str = Form(""),
+    recorder: str = Form(""),
+    duration_sec: float = Form(0),
 ):
     today = datetime.date.today().strftime("%Y-%m-%d")
     source_title = f"{today} {title}"
@@ -165,11 +339,33 @@ async def upload(
             except Exception:
                 pass
 
+            notebook_url = f"https://notebooklm.google.com/notebook/{nb_id}"
+
+            # Firebaseへ共有保存(未設定・失敗でも本体の結果は返す)
+            firebase_id = None
+            firebase_error = None
+            if fb_ready():
+                try:
+                    firebase_id = await asyncio.to_thread(_fb_save, audio_path, {
+                        "title": title,
+                        "source_title": source_title,
+                        "recorder": recorder,
+                        "minutes": minutes,
+                        "notebook_id": nb_id,
+                        "notebook_url": notebook_url,
+                        "duration_sec": duration_sec,
+                    })
+                except Exception as e:
+                    firebase_error = str(e)[:300]
+
             return {
                 "minutes": minutes,
                 "notebook_id": nb_id,
-                "notebook_url": f"https://notebooklm.google.com/notebook/{nb_id}",
+                "notebook_url": notebook_url,
                 "source_title": source_title,
+                "firebase_saved": firebase_id is not None,
+                "firebase_id": firebase_id,
+                "firebase_error": firebase_error,
             }
     except HTTPException:
         raise

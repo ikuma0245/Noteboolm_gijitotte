@@ -15,7 +15,7 @@ python3 -m venv .venv
 
 echo "[2/3] ライブラリをインストール中...(数分かかります)"
 .venv/bin/pip install --quiet --upgrade pip
-.venv/bin/pip install --quiet "notebooklm-py[browser]" fastapi uvicorn python-multipart imageio-ffmpeg
+.venv/bin/pip install --quiet "notebooklm-py[browser]" fastapi uvicorn python-multipart imageio-ffmpeg firebase-admin
 
 echo "[3/3] ログイン用ブラウザをダウンロード中..."
 .venv/bin/playwright install chromium

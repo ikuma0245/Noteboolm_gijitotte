@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>会議一覧 — 議事録レコーダー</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📚</text></svg>">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1a1d21; --sub: #6b7280;
+    --accent: #2563eb; --accent-hover: #1d4ed8; --border: #e5e7eb; --error: #dc2626;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh; padding: 24px 16px;
+  }
+  .container { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  h1 a { font-size: 14px; font-weight: 400; color: var(--accent); text-decoration: none; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input[type=search] {
+    flex: 1; min-width: 200px; font-size: 14px; padding: 9px 12px;
+    border: 1px solid var(--border); border-radius: 8px; font-family: inherit;
+  }
+  input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  .note { font-size: 13px; color: var(--sub); }
+  .note.error { color: var(--error); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+  th { font-size: 12px; color: var(--sub); font-weight: 600; }
+  tr.row { cursor: pointer; }
+  tr.row:hover { background: var(--bg); }
+  .dur { font-variant-numeric: tabular-nums; color: var(--sub); }
+  .btn {
+    font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--card); color: var(--text);
+    cursor: pointer; text-decoration: none; display: inline-block;
+  }
+  .btn:hover { background: var(--bg); }
+  .btn.danger { color: var(--error); border-color: var(--error); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #detail { display: none; }
+  .detail-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .detail-head h2 { font-size: 17px; }
+  .meta { font-size: 13px; color: var(--sub); margin-bottom: 12px; }
+  audio { width: 100%; margin: 10px 0 14px; }
+  .minutes { font-size: 14.5px; line-height: 1.9; }
+  .minutes h1, .minutes h2, .minutes h3 { margin: 14px 0 6px; font-size: 16px; }
+  .minutes ul, .minutes ol { padding-left: 22px; margin: 4px 0; }
+  .minutes p { margin: 6px 0; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📚 会議一覧<a href="/">← レコーダーに戻る</a></h1>
+
+  <div class="card">
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="会議名・記録者で検索">
+      <button class="btn" id="reloadBtn">🔄 更新</button>
+      <span class="note" id="listNote">読み込み中…</span>
+    </div>
+    <table id="tbl" style="margin-top:12px">
+      <thead><tr><th>日時</th><th>会議名</th><th>記録者</th><th>録音時間</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="detail">
+    <div class="detail-head">
+      <h2 id="dTitle"></h2>
+      <div class="actions">
+        <button class="btn" id="dCopy">📋 議事録をコピー</button>
+        <a class="btn primary" id="dNb" href="#" target="_blank">🔗 NotebookLM</a>
+        <button class="btn danger" id="dDelete">🗑 削除</button>
+      </div>
+    </div>
+    <div class="meta" id="dMeta"></div>
+    <audio controls preload="none" id="dAudio"></audio>
+    <div class="minutes" id="dMinutes"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let meetings = [];
+  let current = null;
+
+  const fmtDur = s => {
+    s = Math.round(s || 0);
+    return String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+  };
+  const fmtDate = iso => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  };
+
+  async function load() {
+    $('listNote').textContent = '読み込み中…';
+    $('listNote').className = 'note';
+    try {
+      const res = await fetch('/api/meetings');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      meetings = data;
+      render();
+      $('listNote').textContent = `${meetings.length}件`;
+    } catch (e) {
+      $('listNote').textContent = e.message;
+      $('listNote').className = 'note error';
+    }
+  }
+
+  function render() {
+    const q = $('q').value.trim().toLowerCase();
+    const rows = meetings.filter(m =>
+      !q || (m.title||'').toLowerCase().includes(q) || (m.recorder||'').toLowerCase().includes(q));
+    $('tbody').innerHTML = '';
+    for (const m of rows) {
+      const tr = document.createElement('tr');
+      tr.className = 'row';
+      tr.innerHTML = `<td>${fmtDate(m.created_at)}</td><td>${escapeHtml(m.title||'(無題)')}</td>
+        <td>${escapeHtml(m.recorder||'—')}</td><td class="dur">${fmtDur(m.duration_sec)}</td>`;
+      tr.addEventListener('click', () => openDetail(m.id));
+      $('tbody').appendChild(tr);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function openDetail(id) {
+    try {
+      const res = await fetch('/api/meetings/' + id);
+      const m = await res.json();
+      if (!res.ok) throw new Error(m.detail || res.statusText);
+      current = m;
+      $('dTitle').textContent = '📝 ' + (m.title || '(無題)');
+      $('dMeta').textContent = `${fmtDate(m.created_at)} / 記録者: ${m.recorder || '—'} / 録音 ${fmtDur(m.duration_sec)}`;
+      $('dNb').href = m.notebook_url || '#';
+      $('dNb').style.display = m.notebook_url ? '' : 'none';
+      $('dAudio').src = `/api/meetings/${id}/audio`;
+      $('dMinutes').innerHTML = (window.marked && marked.parse) ? marked.parse(m.minutes || '') : '<pre>' + escapeHtml(m.minutes||'') + '</pre>';
+      $('detail').style.display = 'block';
+      $('detail').scrollIntoView({ behavior: 'smooth' });
+    } catch (e) {
+      alert('読み込みに失敗: ' + e.message);
+    }
+  }
+
+  $('dCopy').addEventListener('click', async () => {
+    if (!current) return;
+    await navigator.clipboard.writeText(current.minutes || '');
+    $('dCopy').textContent = '✓ コピーしました';
+    setTimeout(() => { $('dCopy').textContent = '📋 議事録をコピー'; }, 1500);
+  });
+
+  $('dDelete').addEventListener('click', async () => {
+    if (!current) return;
+    if (!confirm(`「${current.title}」を削除しますか?(音声と議事録の共有保存が消えます。NotebookLM側は残ります)`)) return;
+    const res = await fetch('/api/meetings/' + current.id, { method: 'DELETE' });
+    if (res.ok) {
+      $('detail').style.display = 'none';
+      current = null;
+      load();
+    } else {
+      alert('削除に失敗しました');
+    }
+  });
+
+  $('q').addEventListener('input', render);
+  $('reloadBtn').addEventListener('click', load);
+  load();
+})();
+</script>
+</body>
+</html>
